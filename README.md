@@ -49,11 +49,11 @@ cd its_multi_agent
 
 ```env
 API_KEY=sk-your-api-key
-BASE_URL=https://api.siliconflow.cn/v1
+BASE_URL=<your-llm-api-base-url>
 MODEL=deepseek-ai/DeepSeek-V3.2
 EMBEDDING_MODEL=Qwen/Qwen3-Embedding-8B
-KNOWLEDGE_BASE_URL=https://iknow.lenovo.com.cn
-RERANK_API_URL=https://api.siliconflow.cn/v1/rerank
+KNOWLEDGE_BASE_URL=<your-knowledge-base-url>
+RERANK_API_URL=<your-rerank-api-url>
 RERANK_MODEL=BAAI/bge-reranker-v2-m3
 ```
 
