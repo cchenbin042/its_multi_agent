@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>SSE 测试页面</title>
+    <style>
+        body { font-family: monospace; padding: 20px; background: #1a1a1a; color: #eee; }
+        .container { max-width: 800px; margin: 0 auto; }
+        input { width: 100%; padding: 10px; margin: 10px 0; font-size: 16px; }
+        button { padding: 10px 20px; font-size: 16px; cursor: pointer; }
+        #logs { background: #000; padding: 10px; height: 400px; overflow-y: auto; margin: 10px 0; }
+        .log-entry { margin: 2px 0; }
+        .step { color: #58a6ff; }
+        .token { color: #3fb950; }
+        .done { color: #f0883e; }
+        .error { color: #f85149; }
+        #answer { background: #21262d; padding: 15px; margin: 10px 0; border-radius: 8px; white-space: pre-wrap; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>SSE 流式测试（绕过 Vue/Vite）</h1>
+        <input type="text" id="question" placeholder="输入问题..." value="如何解决ASDL上网慢的故障">
+        <button onclick="testDirect()">直接调用后端 (8001)</button>
+        <button onclick="testProxy()">通过 Vite 代理 (3000)</button>
+        <button onclick="clearLogs()">清空日志</button>
+        <div id="logs"></div>
+        <div id="answer"></div>
+    </div>
+
+    <script>
+        let fullAnswer = '';
+        let stepCount = 0;
+        let tokenCount = 0;
+
+        function log(type, msg) {
+            const logsDiv = document.getElementById('logs');
+            const entry = document.createElement('div');
+            entry.className = `log-entry ${type}`;
+            entry.textContent = `[${type.toUpperCase()}] ${msg}`;
+            logsDiv.appendChild(entry);
+            logsDiv.scrollTop = logsDiv.scrollHeight;
+        }
+
+        function clearLogs() {
+            document.getElementById('logs').innerHTML = '';
+            document.getElementById('answer').textContent = '';
+            fullAnswer = '';
+            stepCount = 0;
+            tokenCount = 0;
+        }
+
+        function testSSE(baseUrl) {
+            const question = document.getElementById('question').value;
+            const url = `${baseUrl}/query/stream`;
+
+            log('step', `开始请求: ${url}`);
+            log('step', `问题: ${question}`);
+
+            fullAnswer = '';
+            stepCount = 0;
+            tokenCount = 0;
+
+            fetch(url, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Accept': 'text/event-stream'
+                },
+                body: JSON.stringify({ question })
+            })
+            .then(response => {
+                log('step', `响应状态: ${response.status}`);
+                log('step', `Content-Type: ${response.headers.get('content-type')}`);
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+
+                function processLine(line) {
+                    const trimmed = line.trim();
+                    if (!trimmed) return;
+
+                    if (trimmed.startsWith('event:')) {
+                        // 新事件类型
+                        return trimmed.slice(6).trim();
+                    } else if (trimmed.startsWith('data:')) {
+                        const dataStr = trimmed.slice(5);
+                        if (!dataStr) return null;
+
+                        try {
+                            const parsed = JSON.parse(dataStr);
+                            const eventType = trimmed.startsWith('event:') ? trimmed.slice(6).trim() : 'unknown';
+                            return { type: eventType, data: parsed };
+                        } catch(e) {
+                            log('error', `解析失败: ${e.message}`);
+                            return null;
+                        }
+                    }
+                    return null;
+                }
+
+                function readChunk() {
+                    reader.read().then(({ done, value }) => {
+                        if (done) {
+                            log('done', '流结束');
+                            log('done', `总计: ${stepCount} 步骤, ${tokenCount} tokens`);
+                            document.getElementById('answer').textContent = fullAnswer;
+                            return;
+                        }
+
+                        // 简化处理：直接按行分割，不考虑缓冲
+                        const text = decoder.decode(value, { stream: true });
+                        buffer += text;
+
+                        // 移除 \r，按 \n 分割
+                        const lines = buffer.replace(/\r/g, '').split('\n');
+                        // 最后一个可能不完整
+                        buffer = lines.pop() || '';
+
+                        let currentEventType = '';
+                        let currentData = '';
+
+                        for (const line of lines) {
+                            const trimmed = line.trim();
+
+                            if (trimmed === '') {
+                                // 空行：处理累积的事件
+                                if (currentEventType && currentData) {
+                                    try {
+                                        const parsed = JSON.parse(currentData);
+                                        handleEvent(currentEventType, parsed);
+                                    } catch(e) {}
+                                }
+                                currentEventType = '';
+                                currentData = '';
+                            } else if (trimmed.startsWith('event:')) {
+                                // 处理之前的累积事件
+                                if (currentEventType && currentData) {
+                                    try {
+                                        const parsed = JSON.parse(currentData);
+                                        handleEvent(currentEventType, parsed);
+                                    } catch(e) {}
+                                }
+                                currentEventType = trimmed.slice(6).trim();
+                                currentData = '';
+                            } else if (trimmed.startsWith('data:')) {
+                                currentData = trimmed.slice(5);
+                            }
+                        }
+
+                        readChunk();
+                    }).catch(err => {
+                        log('error', `读取错误: ${err.message}`);
+                    });
+                }
+
+                readChunk();
+            })
+            .catch(err => {
+                log('error', `请求失败: ${err.message}`);
+            });
+        }
+
+        function handleEvent(type, data) {
+            if (type === 'step') {
+                stepCount++;
+                log('step', `${data.step}: ${data.status} (${data.duration_ms || 0}ms)`);
+            } else if (type === 'token') {
+                tokenCount++;
+                fullAnswer += data.content || '';
+                if (tokenCount % 20 === 0) {
+                    log('token', `已收到 ${tokenCount} tokens, 内容长度: ${fullAnswer.length}`);
+                }
+            } else if (type === 'done') {
+                log('done', `完成! sources: ${data.sources?.length || 0}`);
+                document.getElementById('answer').textContent = fullAnswer;
+            }
+        }
+
+        function testDirect() {
+            testSSE('http://127.0.0.1:8001');
+        }
+
+        function testProxy() {
+            testSSE('http://localhost:3000/api');
+        }
+    </script>
+</body>
+</html>

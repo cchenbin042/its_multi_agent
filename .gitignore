@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Environment
+.env
+.venv/
+venv/
+
+# Node.js / Vite
+node_modules/
+dist/
+
+# Chroma vector database
+chroma_kb/
+
+# Runtime data
+**/data/crawl/
+**/data/tmp/
+**/data/analytics.db
+
+# IDE / Editor
+.idea/
+.vscode/
+
+# Docker
+docker/
+docker-compose.yml
+.dockerignore
+
+# Daily reports & temp reports
+daily_report_*.md
+report/
+
+# Documentation
+docs/
+
+# Tests
+tests/
+
+# Claude Code local config
+.claude/
+.superpowers/
