@@ -1,5 +1,8 @@
 # backend/its_knowledge/repositories/full_document_repository.py
 import json
+import sqlite3
+import threading
+import os
 from typing import List, Optional, Tuple, Dict, Any
 
 from langchain_chroma import Chroma
@@ -19,6 +22,9 @@ class FullDocumentRepository:
     """
 
     def __init__(self):
+        self._lock = threading.Lock()
+        self._init_db()
+
         self.embedding = OpenAIEmbeddings(
             model=settings.EMBEDDING_MODEL,
             openai_api_key=settings.API_KEY,
@@ -30,6 +36,58 @@ class FullDocumentRepository:
             embedding_function=self.embedding
         )
 
+        # 存量迁移：将 Chroma 中已有的文档索引写入 SQLite（仅首次为空时执行）
+        self._migrate_from_chroma()
+
+    def _init_db(self):
+        """初始化 SQLite 文档索引表"""
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        db_path = os.path.join(project_root, "data", "analytics.db")
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        self.db_path = db_path
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS document_index (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    path TEXT NOT NULL
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_doc_title ON document_index(title)"
+            )
+        logger.info(f"SQLite 文档索引表已就绪: {self.db_path}")
+
+    def _migrate_from_chroma(self):
+        """将 Chroma 中已有的全文档元数据迁移到 SQLite 索引表（仅首次执行）"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute("SELECT COUNT(*) FROM document_index").fetchone()
+                if row[0] > 0:
+                    return  # 已有索引数据，无需迁移
+
+            results = self.collection.get(include=["metadatas"])
+            if not results or not results.get('metadatas'):
+                return
+
+            docs_to_insert = []
+            for i, meta in enumerate(results['metadatas']):
+                doc_id = results['ids'][i] if results.get('ids') else f"legacy_{i}"
+                title = meta.get('title', '') or ''
+                path = meta.get('path', '') or ''
+                docs_to_insert.append((doc_id, title, path))
+
+            if docs_to_insert:
+                with self._lock:
+                    with sqlite3.connect(self.db_path) as conn:
+                        conn.executemany(
+                            "INSERT OR IGNORE INTO document_index (id, title, path) VALUES (?, ?, ?)",
+                            docs_to_insert
+                        )
+                logger.info(f"已从 Chroma 迁移 {len(docs_to_insert)} 条文档索引到 SQLite")
+        except Exception as e:
+            logger.warning(f"Chroma -> SQLite 数据迁移跳过（不影响新文档入库）: {e}")
+
     def add_document(self, content: str, title: str, path: str, title_vector: List[float]) -> Optional[str]:
         doc = Document(
             page_content=content,
@@ -40,8 +98,19 @@ class FullDocumentRepository:
             }
         )
         ids = self.collection.add_documents([doc])
+        doc_id = ids[0] if ids else None
+
+        # 同步写入 SQLite 索引
+        if doc_id:
+            with self._lock:
+                with sqlite3.connect(self.db_path) as conn:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO document_index (id, title, path) VALUES (?, ?, ?)",
+                        (doc_id, title, path)
+                    )
+
         logger.info(f"全文档已存储: {title}")
-        return ids[0] if ids else None
+        return doc_id
 
     def get_by_title(self, title: str) -> Optional[Document]:
         results = self.collection.get(where={"title": title})
@@ -68,6 +137,13 @@ class FullDocumentRepository:
             results = self.collection.get(where={"title": title})
             if results and results.get("ids"):
                 self.collection.delete(ids=results["ids"])
+                # 同步从 SQLite 删除
+                with self._lock:
+                    with sqlite3.connect(self.db_path) as conn:
+                        conn.execute(
+                            "DELETE FROM document_index WHERE title = ?",
+                            (title,)
+                        )
                 logger.info(f"全文档已删除: {title}")
                 return True
         except Exception as e:
@@ -75,10 +151,53 @@ class FullDocumentRepository:
         return False
 
     def count(self) -> int:
-        return self.collection._collection.count()
+        """从 SQLite 索引获取文档总数，避免 Chroma 全量加载"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute("SELECT COUNT(*) FROM document_index").fetchone()
+                return row[0]
+        except Exception as e:
+            logger.error(f"SQLite count 失败，回退到 Chroma: {e}")
+            return self.collection._collection.count()
 
     def list_all(self, offset: int = 0, limit: int = 20, search: str = None) -> Tuple[List[Dict[str, Any]], int]:
-        """分页列出文档，支持按标题搜索"""
+        """从 SQLite 索引分页查询，支持标题模糊搜索，O(1) 内存"""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                if search:
+                    pattern = f"%{search}%"
+                    count_row = conn.execute(
+                        "SELECT COUNT(*) FROM document_index WHERE title LIKE ?",
+                        (pattern,)
+                    ).fetchone()
+                    total = count_row[0]
+                    rows = conn.execute(
+                        "SELECT id, title, path FROM document_index "
+                        "WHERE title LIKE ? ORDER BY title LIMIT ? OFFSET ?",
+                        (pattern, limit, offset)
+                    ).fetchall()
+                else:
+                    count_row = conn.execute(
+                        "SELECT COUNT(*) FROM document_index"
+                    ).fetchone()
+                    total = count_row[0]
+                    rows = conn.execute(
+                        "SELECT id, title, path FROM document_index "
+                        "ORDER BY title LIMIT ? OFFSET ?",
+                        (limit, offset)
+                    ).fetchall()
+        except Exception as e:
+            logger.error(f"SQLite list_all 失败，回退到 Chroma 全量查询: {e}")
+            return self._list_all_fallback(offset, limit, search)
+
+        docs = [
+            {"id": r[0], "title": r[1], "path": r[2]}
+            for r in rows
+        ]
+        return docs, total
+
+    def _list_all_fallback(self, offset: int = 0, limit: int = 20, search: str = None) -> Tuple[List[Dict[str, Any]], int]:
+        """回退方案：使用 Chroma 全量查询（原实现）"""
         results = self.collection.get(include=["metadatas"])
         if not results or not results.get('metadatas'):
             return [], 0

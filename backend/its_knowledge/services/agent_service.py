@@ -174,8 +174,8 @@ class AgentService:
                     }, ensure_ascii=False),
                 }
 
-                # 调用 LLM
-                response = llm_with_tools.invoke(messages)
+                # 调用 LLM（异步）
+                response = await llm_with_tools.ainvoke(messages)
                 reasoning = _extract_reasoning(response)
 
                 # 检查是否有 tool calls
@@ -193,7 +193,7 @@ class AgentService:
 
                         # 执行工具
                         if tool_name in tool_map:
-                            tool_result = tool_map[tool_name].invoke(tool_args)
+                            tool_result = await tool_map[tool_name].ainvoke(tool_args)
                             messages.append(response)
                             messages.append({
                                 "role": "tool",
@@ -250,7 +250,7 @@ class AgentService:
                     full_answer = "当前的知识库中暂时没有找到该问题的解决方案。"
                 else:
                     full_answer = "已达到最大搜索轮次，基于已获取的信息：\n"
-                    final_response = llm_with_tools.invoke(
+                    final_response = await llm_with_tools.ainvoke(
                         messages + [HumanMessage(
                             content="请基于以上所有搜索结果，给用户一个综合回答。"
                         )]
